@@ -1,74 +1,650 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * Thrustmaster T500RS Racing Wheel Driver
+ *
+ * Copyright (c) 2024 Thrustmaster
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
+
 #include "hid-tmt500rs.h"
 
-static int timer_msecs = DEFAULT_TIMER_PERIOD;
-module_param(timer_msecs, int, 0660);
-MODULE_PARM_DESC(timer_msecs, "Timer resolution in msecs");
+/* Static function declarations */
+static int t500rs_upload_constant(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_upload_ramp(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_upload_periodic(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_upload_condition(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state, u8 effect_type);
+static int t500rs_upload_condition_extended(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state, u8 effect_type);
+static int t500rs_upload_combined(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_upload_inertia(struct t500rs_device_entry *t500rs,
+        struct t500rs_inertia *params);
+static int t500rs_upload_autocenter(struct t500rs_device_entry *t500rs,
+        struct t500rs_autocenter *params);
+static int t500rs_upload_envelope(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_send_effect(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state, u8 command_id,
+        const u8 *params, size_t params_size);
+static int t500rs_play_effect(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_stop_effect(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state);
+static int t500rs_upload_weight(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state,
+        struct t500rs_weight_update *update);
+static int t500rs_send_int(struct input_dev *dev, u8 *send_buffer, int *trans);
+static int t500rs_upload_custom_int(struct input_dev *dev, u8 *send_buffer, int *trans);
+static int t500rs_timer_helper(struct t500rs_device_entry *t500rs);
+static enum hrtimer_restart t500rs_timer(struct hrtimer *t);
+static int t500rs_upload(struct input_dev *dev,
+		struct ff_effect *effect, struct ff_effect *old);
+static int t500rs_play(struct input_dev *dev, int effect_id, int value);
+static ssize_t spring_level_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t spring_level_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t damper_level_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t damper_level_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t friction_level_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t friction_level_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static ssize_t range_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count);
+static ssize_t range_show(struct device *dev,
+		struct device_attribute *attr, char *buf);
+static void t500rs_set_autocenter(struct input_dev *dev, u16 value);
+static void t500rs_set_gain(struct input_dev *dev, u16 gain);
+static void t500rs_destroy(struct ff_device *ff);
+static int t500rs_open(struct input_dev *dev);
+static void t500rs_close(struct input_dev *dev);
+static int t500rs_create_files(struct hid_device *hdev);
+static int t500rs_init(struct hid_device *hdev, const signed short *ff_bits);
+static int t500rs_probe(struct hid_device *hdev, const struct hid_device_id *id);
+static void t500rs_remove(struct hid_device *hdev);
+static __u8 *t500rs_report_fixup(struct hid_device *hdev, __u8 *rdesc, unsigned int *rsize);
 
-static int spring_level = 30;
-module_param(spring_level, int, 0);
-MODULE_PARM_DESC(spring_level, "Level of spring force (0-100), as per Oversteer standards");
+/* Force feedback effect bits supported by the device */
+static const signed short t500rs_ff_effects[] = {
+    FF_CONSTANT,
+    FF_RAMP,
+    FF_SPRING,
+    FF_DAMPER,
+    FF_FRICTION,
+    FF_INERTIA,
+    FF_PERIODIC,
+    FF_SINE,
+    FF_TRIANGLE,
+    FF_SQUARE,
+    FF_SAW_UP,
+    FF_SAW_DOWN,
+    FF_AUTOCENTER,
+    FF_GAIN,
+    -1
+};
 
-static int damper_level = 30;
-module_param(damper_level, int, 0);
-MODULE_PARM_DESC(damper_level, "Level of damper force (0-100), as per Oversteer standards");
-
-static int friction_level = 30;
-module_param(friction_level, int, 0);
-MODULE_PARM_DESC(friction_level, "Level of friction force (0-100), as per Oversteer standards");
-
-static struct t500rs_device_entry *t500rs_get_device(struct hid_device *hdev)
+/* Core force feedback effect handling */
+static int t500rs_upload_effect(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
 {
-	struct t500rs_data *drv_data;
-	struct t500rs_device_entry *t500rs;
+    u8 params[13];
+    int ret;
 
-	spin_lock_irqsave(&lock, lock_flags);
-	drv_data = hid_get_drvdata(hdev);
-	if (!drv_data) {
-		hid_err(hdev, "private data not found\n");
-		return NULL;
-	}
+    /* Check if this is a combined effect */
+    if (state->combined)
+        return t500rs_upload_combined(t500rs, state);
 
-	t500rs = drv_data->device_props;
-	if (!t500rs) {
-		hid_err(hdev, "device properties not found\n");
-		return NULL;
-	}
-	spin_unlock_irqrestore(&lock, lock_flags);
-	return t500rs;
+    /* First upload the basic effect */
+    switch (state->effect.type) {
+    case FF_CONSTANT:
+        ret = t500rs_upload_constant(t500rs, state);
+        if (ret)
+            return ret;
+        if (state->effect.u.constant.envelope.attack_length ||
+            state->effect.u.constant.envelope.fade_length) {
+            ret = t500rs_upload_envelope(t500rs, state);
+            if (ret)
+                return ret;
+        }
+        break;
+    case FF_RAMP:
+        ret = t500rs_upload_ramp(t500rs, state);
+        if (ret)
+            return ret;
+        if (state->effect.u.ramp.envelope.attack_length ||
+            state->effect.u.ramp.envelope.fade_length) {
+            ret = t500rs_upload_envelope(t500rs, state);
+            if (ret)
+                return ret;
+        }
+        break;
+    case FF_SPRING:
+        ret = t500rs_upload_condition(t500rs, state, T500RS_EFFECT_SPRING);
+        break;
+    case FF_DAMPER:
+        /* Use extended damper by default for better feel */
+        ret = t500rs_upload_condition_extended(t500rs, state, T500RS_EFFECT_DAMPER_2);
+        break;
+    case FF_FRICTION:
+        /* Use extended friction by default for better feel */
+        ret = t500rs_upload_condition_extended(t500rs, state, T500RS_EFFECT_FRICTION_2);
+        break;
+    case FF_INERTIA:
+        {
+            struct t500rs_inertia params = {
+                .strength = state->effect.u.condition[0].right_coeff >> 8,
+                .damping = state->effect.u.condition[0].left_coeff >> 8,
+                .resistance = state->effect.u.condition[0].center >> 8
+            };
+            ret = t500rs_upload_inertia(t500rs, &params);
+        }
+        break;
+    case FF_PERIODIC:
+        ret = t500rs_upload_periodic(t500rs, state);
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    /* Set duration if specified */
+    if (state->effect.replay.length)
+        ret = t500rs_modify_duration(t500rs, state);
+
+    return ret;
+}
+
+/* Basic force feedback effects */
+static int t500rs_upload_constant(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
+{
+    u8 params[13];
+    int ret;
+
+    /* Set envelope parameters */
+    params[0] = T500RS_CMD_SET_ENVELOPE;
+    params[1] = 0x1c;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_ENVELOPE, params, 9);
+    if (ret < 0)
+        return ret;
+
+    /* Set constant force parameters */
+    params[0] = T500RS_CMD_SET_CONSTANT;
+    params[1] = 0x0e;
+    params[2] = 0x00;
+    params[3] = state->effect.u.constant.level;  /* Force level */
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_CONSTANT, params, 4);
+    if (ret < 0)
+        return ret;
+
+    /* Upload effect */
+    params[0] = T500RS_CMD_UPLOAD_EFFECT;
+    params[1] = 0x00;
+    params[2] = T500RS_EFFECT_CONSTANT;
+    params[3] = 0x40;
+    params[4] = 0x17;
+    params[5] = 0x25;
+    params[6] = 0x00;
+    params[7] = 0xff;
+    params[8] = 0xff;
+    params[9] = 0x0e;
+    params[10] = 0x00;
+    params[11] = 0x1c;
+    params[12] = 0x00;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPLOAD_EFFECT, params, 13);
+}
+
+static int t500rs_upload_ramp(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
+{
+    u8 params[13];
+    int ret;
+
+    /* Set envelope parameters */
+    params[0] = T500RS_CMD_SET_ENVELOPE;
+    params[1] = 0x1c;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_ENVELOPE, params, 9);
+    if (ret < 0)
+        return ret;
+
+    /* Set ramp force parameters */
+    params[0] = T500RS_CMD_SET_RAMP;
+    params[1] = 0x0e;
+    params[2] = 0x00;
+    params[3] = state->effect.u.ramp.start_level;  /* Start level */
+    params[4] = state->effect.u.ramp.end_level;  /* End level */
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_RAMP, params, 5);
+    if (ret < 0)
+        return ret;
+
+    /* Upload effect */
+    params[0] = T500RS_CMD_UPLOAD_EFFECT;
+    params[1] = 0x00;
+    params[2] = T500RS_EFFECT_RAMP;
+    params[3] = 0x40;
+    params[4] = 0x17;
+    params[5] = 0x25;
+    params[6] = 0x00;
+    params[7] = 0xff;
+    params[8] = 0xff;
+    params[9] = 0x0e;
+    params[10] = 0x00;
+    params[11] = 0x1c;
+    params[12] = 0x00;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPLOAD_EFFECT, params, 13);
+}
+
+static int t500rs_upload_periodic(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
+{
+    u8 params[13];
+    int ret;
+    u8 waveform;
+
+    /* Map effect type to T500RS waveform */
+    switch (state->effect.type) {
+    case FF_SINE:
+        waveform = T500RS_EFFECT_SINE;
+        break;
+    case FF_SQUARE:
+        waveform = T500RS_EFFECT_SQUARE;
+        break;
+    case FF_TRIANGLE:
+        waveform = T500RS_EFFECT_TRIANGLE;
+        break;
+    case FF_SAW_UP:
+        waveform = T500RS_EFFECT_SAWTOOTH_UP;
+        break;
+    case FF_SAW_DOWN:
+        waveform = T500RS_EFFECT_SAWTOOTH_DOWN;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    /* Set envelope parameters */
+    params[0] = T500RS_CMD_SET_ENVELOPE;
+    params[1] = 0x1c;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_ENVELOPE, params, 9);
+    if (ret < 0)
+        return ret;
+
+    /* Set periodic parameters */
+    params[0] = T500RS_CMD_SET_PERIODIC;
+    params[1] = 0x0e;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0xe8;
+    params[7] = 0x03;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_PERIODIC, params, 8);
+    if (ret < 0)
+        return ret;
+
+    /* Upload effect */
+    params[0] = T500RS_CMD_UPLOAD_EFFECT;
+    params[1] = 0x00;
+    params[2] = waveform;
+    params[3] = 0x40;
+    params[4] = 0x17;
+    params[5] = 0x25;
+    params[6] = 0x00;
+    params[7] = 0xff;
+    params[8] = 0xff;
+    params[9] = 0x0e;
+    params[10] = 0x00;
+    params[11] = 0x1c;
+    params[12] = 0x00;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPLOAD_EFFECT, params, 13);
+}
+
+/* Condition-based effects */
+static int t500rs_upload_condition(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state,
+        u8 effect_type)
+{
+    u8 params[13];
+    int ret;
+
+    /* Set condition parameters */
+    params[0] = T500RS_CMD_SET_CONDITION;
+    params[1] = 0x0e;
+    params[2] = 0x00;
+    params[3] = 0x64;  /* Center */
+    params[4] = 0x64;  /* Deadband */
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+    params[9] = 0x64;  /* Coefficient */
+    params[10] = 0x64;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_CONDITION, params, 11);
+    if (ret < 0)
+        return ret;
+
+    /* Set envelope parameters */
+    params[0] = T500RS_CMD_SET_ENVELOPE;
+    params[1] = 0x1c;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_ENVELOPE, params, 9);
+    if (ret < 0)
+        return ret;
+
+    /* Upload effect */
+    params[0] = T500RS_CMD_UPLOAD_EFFECT;
+    params[1] = 0x00;
+    params[2] = effect_type;
+    params[3] = 0x40;
+    params[4] = 0x17;
+    params[5] = 0x25;
+    params[6] = 0x00;
+    params[7] = 0xff;
+    params[8] = 0xff;
+    params[9] = 0x0e;
+    params[10] = 0x00;
+    params[11] = 0x1c;
+    params[12] = 0x00;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPLOAD_EFFECT, params, 13);
+}
+
+static int t500rs_upload_condition_extended(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state,
+        u8 effect_type)
+{
+    u8 params[15];
+    struct ff_effect *effect = &state->effect;
+    struct t500rs_condition_extended ext = {0};
+    
+    /* Convert condition effect parameters */
+    ext.basic.right_coeff = effect->u.condition[0].right_coeff >> 8;
+    ext.basic.left_coeff = effect->u.condition[0].left_coeff >> 8;
+    ext.basic.right_sat = effect->u.condition[0].right_saturation >> 9;
+    ext.basic.left_sat = effect->u.condition[0].left_saturation >> 9;
+    ext.basic.dead_band = effect->u.condition[0].deadband >> 9;
+    ext.basic.center = effect->u.condition[0].center >> 9;
+
+    /* Add extended parameters based on effect type */
+    if (effect_type == T500RS_EFFECT_DAMPER_2) {
+        ext.velocity_factor = 0x64;     /* Default from captures */
+        ext.acceleration_factor = 0x32;  /* Default from captures */
+    } else if (effect_type == T500RS_EFFECT_FRICTION_2) {
+        ext.position_factor = 0x64;     /* Default from captures */
+        ext.velocity_factor = 0x32;     /* Default from captures */
+    }
+
+    params[0] = effect_type;
+    params[1] = 0x00;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x05;
+    params[5] = 0x0e;
+    /* Basic parameters */
+    params[6] = ext.basic.right_coeff;
+    params[7] = ext.basic.left_coeff;
+    params[8] = ext.basic.right_sat;
+    params[9] = ext.basic.left_sat;
+    params[10] = ext.basic.dead_band;
+    params[11] = ext.basic.center;
+    /* Extended parameters */
+    params[12] = ext.velocity_factor;
+    params[13] = ext.acceleration_factor;
+    params[14] = ext.position_factor;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPDATE, params, 15);
+}
+
+/* Advanced effects */
+static int t500rs_upload_combined(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
+{
+    u8 params[8 + T500RS_MAX_COMBINED_EFFECTS * 3] = {0};  /* Extra byte per effect for flags */
+    struct t500rs_combined_effect *combined = state->combined;
+    int i;
+
+    if (!combined || combined->num_effects == 0 ||
+        combined->num_effects > T500RS_MAX_COMBINED_EFFECTS)
+        return -EINVAL;
+
+    params[0] = T500RS_EFFECT_COMBINE;
+    params[1] = 0x00;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x05;
+    params[5] = 0x0e;
+    params[6] = combined->num_effects;
+    params[7] = combined->dynamic_weights ? 0x01 : 0x00;
+
+    /* Pack effect IDs, weights, and ranges */
+    for (i = 0; i < combined->num_effects; i++) {
+        params[8 + i * 3] = combined->effect_ids[i];
+        params[9 + i * 3] = combined->weights[i];
+        /* Pack min/max into a single byte if dynamic weights enabled */
+        if (combined->dynamic_weights) {
+            params[10 + i * 3] = (combined->min_weights[i] & 0xF0) |
+                                ((combined->max_weights[i] >> 4) & 0x0F);
+        }
+    }
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPDATE, 
+                            params, 8 + combined->num_effects * 
+                            (combined->dynamic_weights ? 3 : 2));
+}
+
+static int t500rs_upload_inertia(struct t500rs_device_entry *t500rs,
+        struct t500rs_inertia *params)
+{
+    u8 cmd[8] = {0};
+    
+    cmd[0] = T500RS_EFFECT_INERTIA;
+    cmd[1] = 0x00;
+    cmd[2] = 0x00;
+    cmd[3] = 0x00;
+    cmd[4] = 0x03;
+    cmd[5] = 0x0e;
+    cmd[6] = params->strength;
+    cmd[7] = params->damping;
+
+    return t500rs_send_effect(t500rs, NULL, T500RS_CMD_UPDATE, cmd, 8);
+}
+
+static int t500rs_upload_autocenter(struct t500rs_device_entry *t500rs,
+        struct t500rs_autocenter *params)
+{
+    u8 cmd[8] = {0};
+    
+    cmd[0] = T500RS_EFFECT_AUTOCENTER;
+    cmd[1] = 0x00;
+    cmd[2] = 0x00;
+    cmd[3] = 0x00;
+    cmd[4] = 0x03;
+    cmd[5] = 0x0e;
+    cmd[6] = params->strength;
+    cmd[7] = params->coefficient;
+
+    return t500rs_send_effect(t500rs, NULL, T500RS_CMD_UPDATE, cmd, 8);
+}
+
+/* Effect modifiers and parameters */
+static int t500rs_upload_envelope(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state)
+{
+    u8 params[13];
+    int ret;
+
+    /* Set envelope parameters */
+    params[0] = T500RS_CMD_SET_ENVELOPE;
+    params[1] = 0x1c;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = 0x00;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x00;
+    params[8] = 0x00;
+
+    ret = t500rs_send_effect(t500rs, state, T500RS_CMD_SET_ENVELOPE, params, 9);
+    if (ret < 0)
+        return ret;
+
+    /* Upload effect */
+    params[0] = T500RS_CMD_UPLOAD_EFFECT;
+    params[1] = 0x00;
+    params[2] = state->effect.type;
+    params[3] = 0x40;
+    params[4] = 0x17;
+    params[5] = 0x25;
+    params[6] = 0x00;
+    params[7] = 0xff;
+    params[8] = 0xff;
+    params[9] = 0x0e;
+    params[10] = 0x00;
+    params[11] = 0x1c;
+    params[12] = 0x00;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPLOAD_EFFECT, params, 13);
+}
+
+static int t500rs_upload_weight(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state,
+        struct t500rs_weight_update *update)
+{
+    u8 params[8] = {0};
+    struct t500rs_combined_effect *combined = state->combined;
+    int i, found = -1;
+
+    if (!combined || !combined->dynamic_weights)
+        return -EINVAL;
+
+    /* Find the effect in the combined effect */
+    for (i = 0; i < combined->num_effects; i++) {
+        if (combined->effect_ids[i] == update->effect_id) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found < 0)
+        return -EINVAL;
+
+    /* Validate weight against min/max */
+    if (update->new_weight < combined->min_weights[found] ||
+        update->new_weight > combined->max_weights[found])
+        return -EINVAL;
+
+    params[0] = T500RS_WEIGHT_UPDATE;
+    params[1] = 0x00;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = update->effect_id;
+    params[5] = update->new_weight;
+    params[6] = update->smooth_transition ? update->transition_steps : 0;
+    params[7] = 0x00;  /* Reserved */
+
+    /* Update the stored weight */
+    combined->weights[found] = update->new_weight;
+
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_UPDATE, params, 8);
+}
+
+/* Low-level communication */
+static int t500rs_send_effect(struct t500rs_device_entry *t500rs,
+        struct t500rs_effect_state *state,
+        u8 command_id,
+        const u8 *params,
+        size_t params_size)
+{
+    u8 *cmd;
+    int ret;
+
+    cmd = kzalloc(T500RS_CMD_HEADER_SIZE + params_size, GFP_KERNEL);
+    if (!cmd)
+        return -ENOMEM;
+
+    /* Copy header */
+    memcpy(cmd, t500rs_cmd_header, T500RS_CMD_HEADER_SIZE);
+    
+    /* Copy parameters if any */
+    if (params && params_size)
+        memcpy(cmd + T500RS_CMD_HEADER_SIZE, params, params_size);
+
+    ret = t500rs_send_int(t500rs->input_dev, cmd, NULL);
+    kfree(cmd);
+    return ret;
 }
 
 static int t500rs_send_int(struct input_dev *dev, u8 *send_buffer, int *trans)
 {
-	struct hid_device *hdev = input_get_drvdata(dev);
-	struct t500rs_device_entry *t500rs;
-	int i;
+    struct hid_device *hdev = input_get_drvdata(dev);
+    struct t500rs_device_entry *t500rs;
+    int i;
 
-	t500rs = t500rs_get_device(hdev);
-	if (!t500rs) {
-		hid_err(hdev, "could not get device\n");
-		return -1;
-	}
-
-	for (i = 0; i < T500RS_BUFFER_LENGTH; ++i)
-		t500rs->ff_field->value[i] = send_buffer[i];
-
-	hid_hw_request(t500rs->hdev, t500rs->report, HID_REQ_SET_REPORT);
-
-	memset(send_buffer, 0, T500RS_BUFFER_LENGTH);
-
-	return 0;
-}
-
-static void t500rs_int_callback(struct urb *urb){
-    if(urb->status){
-        hid_warn(urb->dev, "urb status %i received\n", urb->status);
+    t500rs = t500rs_get_device(hdev);
+    if (!t500rs) {
+        hid_err(hdev, "could not get device\n");
+        return -1;
     }
 
-    usb_free_urb(urb);
+    for (i = 0; i < T500RS_BUFFER_LENGTH; ++i)
+        t500rs->ff_field->value[i] = send_buffer[i];
+
+    hid_hw_request(t500rs->hdev, t500rs->report, HID_REQ_SET_REPORT);
+
+    memset(send_buffer, 0, T500RS_BUFFER_LENGTH);
+
+    return 0;
 }
 
-static int t500rs_send_custom_int(struct input_dev *dev, u8 *send_buffer, int *trans){
+static int t500rs_upload_custom_int(struct input_dev *dev, u8 *send_buffer, int *trans){
     struct hid_device *hdev = input_get_drvdata(dev);
     struct t500rs_device_entry *t500rs;
     struct usb_device *usbdev;
@@ -99,847 +675,42 @@ static int t500rs_send_custom_int(struct input_dev *dev, u8 *send_buffer, int *t
     return usb_submit_urb(urb, GFP_ATOMIC);
 }
 
+/* Effect playback control */
 static int t500rs_play_effect(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
+        struct t500rs_effect_state *state)
 {
-	u8 *send_buffer = t500rs->send_buffer;
-	int ret, trans;
+    u8 params[8] = {0};
+    
+    params[0] = T500RS_EFFECT_CONSTANT;
+    params[1] = 0x00;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = T500RS_CMD_PLAY;
+    params[5] = 0x00;
+    params[6] = 0x41;
+    params[7] = 0x01;
 
-
-	send_buffer[1] = state->effect.id + 1;
-	send_buffer[2] = 0x89;
-	send_buffer[3] = 0x01;
-
-	ret = t500rs_send_custom_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed starting effect play\n");
-
-	return ret;
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_PLAY, params, 8);
 }
 
 static int t500rs_stop_effect(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
+        struct t500rs_effect_state *state)
 {
-	u8 *send_buffer = t500rs->send_buffer;
-	int ret, trans;
+    u8 params[8] = {0};
+    
+    params[0] = T500RS_EFFECT_CONSTANT;
+    params[1] = 0x00;
+    params[2] = 0x00;
+    params[3] = 0x00;
+    params[4] = T500RS_CMD_PLAY;
+    params[5] = 0x00;
+    params[6] = 0x00;
+    params[7] = 0x01;
 
-
-	send_buffer[1] = state->effect.id + 1;
-	send_buffer[2] = 0x89;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed stopping effect play\n");
-
-	return ret;
+    return t500rs_send_effect(t500rs, state, T500RS_CMD_STOP, params, 8);
 }
 
-static void t500rs_fill_envelope(u8 *send_buffer, int i, s16 level,
-		u16 duration, struct ff_envelope *envelope)
-{
-	u16 attack_length = (duration * envelope->attack_length) / 0x7fff;
-	u16 attack_level = (level * envelope->attack_level) / 0x7fff;
-	u16 fade_length = (duration * envelope->fade_length) / 0x7fff;
-	u16 fade_level = (level * envelope->fade_level) / 0x7fff;
-
-	send_buffer[i + 0] = attack_length & 0xff;
-	send_buffer[i + 1] = attack_length >> 8;
-	send_buffer[i + 2] = attack_level & 0xff;
-	send_buffer[i + 3] = attack_level >> 8;
-	send_buffer[i + 4] = fade_length & 0xff;
-	send_buffer[i + 5] = fade_length >> 8;
-	send_buffer[i + 6] = fade_level & 0xff;
-	send_buffer[i + 7] = fade_level >> 8;
-}
-
-static int t500rs_modify_envelope(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state,
-		u8 *send_buffer,
-		s16 level,
-		u16 duration,
-		u8 id,
-		struct ff_envelope envelope,
-		struct ff_envelope envelope_old
-		)
-{
-	u16 attack_length, attack_level, fade_length, fade_level;
-	int ret = 0, trans;
-
-	if (duration == 0)
-		duration = 0xffff;
-
-	attack_length = (duration * envelope.attack_length) / 0x7fff;
-	attack_level = (level * envelope.attack_level) / 0x7fff;
-	fade_length = (duration * envelope.fade_length) / 0x7fff;
-	fade_level = (level * envelope.fade_level) / 0x7fff;
-
-
-	send_buffer[1] = id + 1;
-	send_buffer[2] = 0x31;
-
-	if (envelope.attack_length != envelope_old.attack_length) {
-		send_buffer[3] = 0x81;
-
-		send_buffer[4] = attack_length & 0xff;
-		send_buffer[5] = attack_length >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying effect envelope\n");
-			goto error;
-		}
-	}
-
-	if (envelope.attack_level != envelope_old.attack_level) {
-		send_buffer[3] = 0x82;
-
-		send_buffer[4] = attack_level & 0xff;
-		send_buffer[5] = attack_level >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying effect envelope\n");
-			goto error;
-		}
-	}
-
-	if (envelope.fade_length != envelope_old.fade_length) {
-		send_buffer[3] = 0x84;
-
-		send_buffer[4] = fade_length & 0xff;
-		send_buffer[5] = fade_length >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying effect envelope\n");
-			goto error;
-		}
-	}
-
-	if (envelope.fade_level != envelope_old.fade_level) {
-		send_buffer[3] = 0x88;
-
-		send_buffer[4] = fade_level & 0xff;
-		send_buffer[5] = fade_level >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying effect envelope\n");
-			goto error;
-		}
-	}
-
-error:
-	return ret;
-}
-
-static int t500rs_modify_duration(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state, u8 *send_buffer)
-{
-	struct ff_effect effect = state->effect;
-	struct ff_effect old = state->old;
-	u16 duration;
-	int ret = 0, trans;
-
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	if (effect.replay.length != old.replay.length) {
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x49;
-		send_buffer[4] = 0x41;
-
-		send_buffer[5] = duration & 0xff;
-		send_buffer[6] = duration >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying duration\n");
-			goto error;
-		}
-	}
-error:
-	return ret;
-}
-
-static int t500rs_modify_constant(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state, u8 *send_buffer)
-{
-	struct ff_effect effect = state->effect;
-	struct ff_effect old = state->old;
-	struct ff_constant_effect constant = effect.u.constant;
-	struct ff_constant_effect constant_old = old.u.constant;
-	int ret, trans;
-	s16 level;
-
-	level = (constant.level * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-
-	if (constant.level != constant_old.level) {
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0a;
-
-		send_buffer[3] = level & 0xff;
-		send_buffer[4] = level >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying constant effect\n");
-			goto error;
-		}
-
-	}
-
-	ret = t500rs_modify_envelope(t500rs,
-			state,
-			send_buffer,
-			level,
-			effect.replay.length,
-			effect.id,
-			constant.envelope,
-			constant_old.envelope
-			);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying constant envelope\n");
-		goto error;
-	}
-
-	ret = t500rs_modify_duration(t500rs, state, send_buffer);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying constant duration\n");
-		goto error;
-	}
-
-error:
-
-	return ret;
-}
-
-static int t500rs_modify_ramp(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state, u8 *send_buffer)
-{
-	struct ff_effect effect = state->effect;
-	struct ff_effect old = state->old;
-	struct ff_ramp_effect ramp = effect.u.ramp;
-	struct ff_ramp_effect ramp_old = old.u.ramp;
-	int ret, trans;
-
-	u16 difference, top, bottom;
-	s16 level;
-
-	top = ramp.end_level > ramp.start_level ? ramp.end_level : ramp.start_level;
-	bottom = ramp.end_level > ramp.start_level ? ramp.start_level : ramp.end_level;
-
-
-	difference = ((top - bottom) * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-
-
-	level = (top * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-
-	if (ramp.start_level != ramp_old.start_level || ramp.end_level != ramp_old.end_level) {
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x03;
-
-		send_buffer[4] = difference & 0xff;
-		send_buffer[5] = difference >> 8;
-
-		send_buffer[6] = level & 0xff;
-		send_buffer[7] = level >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying ramp effect\n");
-			goto error;
-		}
-
-	}
-
-	ret = t500rs_modify_envelope(t500rs,
-			state,
-			send_buffer,
-			level,
-			effect.replay.length,
-			effect.id,
-			ramp.envelope,
-			ramp_old.envelope
-			);
-
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying ramp envelope\n");
-		goto error;
-	}
-
-	ret = t500rs_modify_duration(t500rs, state, send_buffer);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying ramp duration\n");
-		goto error;
-	}
-
-error:
-
-	return ret;
-}
-static int t500rs_modify_damper(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state, u8 *send_buffer)
-{
-	struct ff_effect effect = state->effect;
-	struct ff_effect old = state->old;
-	struct ff_condition_effect damper = effect.u.condition[0];
-	struct ff_condition_effect damper_old = old.u.condition[0];
-	int ret, trans, input_level;
-
-	input_level = damper_level;
-	if (state->effect.type == FF_FRICTION)
-		input_level = friction_level;
-
-	if (state->effect.type == FF_SPRING)
-		input_level = spring_level;
-
-	if (damper.right_coeff != damper_old.right_coeff) {
-		s16 coeff = damper.right_coeff * input_level / 100;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x41;
-
-		send_buffer[4] = coeff & 0xff;
-		send_buffer[5] = coeff >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying damper rc\n");
-			goto error;
-		}
-
-	}
-
-	if (damper.left_coeff != damper_old.left_coeff) {
-		s16 coeff = damper.left_coeff * input_level / 100;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x42;
-
-		send_buffer[4] = coeff & 0xff;
-		send_buffer[5] = coeff >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying damper lc\n");
-			goto error;
-		}
-
-	}
-
-	if ((damper.deadband != damper_old.deadband)  ||
-		(damper.center	 != damper_old.center)) {
-		u16 deadband_right = 0xfffe - damper.deadband - damper.center;
-		u16 deadband_left = 0xfffe - damper.deadband + damper.center;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x4c;
-
-		send_buffer[4] = deadband_right & 0xff;
-		send_buffer[5] = deadband_right >> 8;
-
-		send_buffer[6] = deadband_left & 0xff;
-		send_buffer[7] = deadband_left >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying damper deadband\n");
-			goto error;
-		}
-
-	}
-
-	ret = t500rs_modify_duration(t500rs, state, send_buffer);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying damper duration\n");
-		goto error;
-	}
-
-error:
-
-	return ret;
-}
-
-
-static int t500rs_modify_periodic(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state, u8 *send_buffer)
-{
-	struct ff_effect effect = state->effect;
-	struct ff_effect old = state->old;
-	struct ff_periodic_effect periodic = effect.u.periodic;
-	struct ff_periodic_effect periodic_old = old.u.periodic;
-	int ret, trans;
-	s16 level;
-
-	level = (periodic.magnitude * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-
-
-	if (periodic.magnitude != periodic_old.magnitude) {
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x01;
-
-		send_buffer[4] = level & 0xff;
-		send_buffer[5] = level >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying periodic magnitude\n");
-			goto error;
-		}
-
-	}
-
-	if (periodic.offset != periodic_old.offset) {
-		s16 offset = periodic.offset;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x02;
-
-		send_buffer[4] = offset & 0xff;
-		send_buffer[5] = offset >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying periodic offset\n");
-			goto error;
-		}
-
-	}
-
-	if (periodic.phase != periodic_old.phase) {
-		s16 phase = periodic.phase;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x04;
-
-		send_buffer[4] = phase & 0xff;
-		send_buffer[5] = phase >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying periodic phase\n");
-			goto error;
-		}
-
-	}
-
-	if (periodic.period != periodic_old.period) {
-		s16 period = periodic.period;
-
-
-		send_buffer[1] = effect.id + 1;
-		send_buffer[2] = 0x0e;
-		send_buffer[3] = 0x08;
-
-		send_buffer[4] = period & 0xff;
-		send_buffer[5] = period >> 8;
-
-		ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-		if (ret) {
-			hid_err(t500rs->hdev, "failed modifying periodic period\n");
-			goto error;
-		}
-
-	}
-
-	ret = t500rs_modify_envelope(t500rs,
-			state,
-			send_buffer,
-			level,
-			effect.replay.length,
-			effect.id,
-			periodic.envelope,
-			periodic_old.envelope);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying periodic envelope\n");
-		goto error;
-	}
-
-	ret = t500rs_modify_duration(t500rs, state, send_buffer);
-	if (ret) {
-		hid_err(t500rs->hdev, "failed modifying periodic duration\n");
-		goto error;
-	}
-
-error:
-
-	return ret;
-}
-
-
-static int t500rs_upload_constant(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	u8 *send_buffer = t500rs->send_buffer;
-	struct ff_effect effect = state->effect;
-	struct ff_constant_effect constant = state->effect.u.constant;
-	s16 level;
-	u16 duration, offset;
-
-	int ret, trans;
-
-	/* some games, such as DiRT Rally 2 have a weird feeling to them, sort of
-	 * like the wheel pulls just a bit to the right or left and then it just
-	 * stops. I wouldn't be surprised if it's got something to do with the
-	 * constant envelope, but right now I don't know.
-	 */
-
-	if (test_bit(FF_EFFECT_PLAYING, &state->flags)	&&
-		test_bit(FF_EFFECT_QUEUE_UPDATE, &state->flags)) {
-		__clear_bit(FF_EFFECT_QUEUE_UPLOAD, &state->flags);
-		return t500rs_modify_constant(t500rs, state, send_buffer);
-	}
-
-	level = (constant.level * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	offset = effect.replay.delay;
-
-
-	send_buffer[1] = effect.id + 1;
-	send_buffer[2] = 0x6a;
-
-	send_buffer[3] = level & 0xff;
-	send_buffer[4] = level >> 8;
-
-	t500rs_fill_envelope(send_buffer, 5, level,
-			duration, &constant.envelope);
-
-	send_buffer[14] = 0x4f;
-
-	send_buffer[15] = duration & 0xff;
-	send_buffer[16] = duration >> 8;
-
-	send_buffer[19] = offset & 0xff;
-	send_buffer[20] = offset >> 8;
-
-	send_buffer[22] = 0xff;
-	send_buffer[23] = 0xff;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed uploading constant effect\n");
-
-	return ret;
-}
-
-static int t500rs_upload_ramp(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	u8 *send_buffer = t500rs->send_buffer;
-	struct ff_effect effect = state->effect;
-	struct ff_ramp_effect ramp = state->effect.u.ramp;
-	int ret, trans;
-	u16 difference, offset, top, bottom, duration;
-	s16 level;
-
-	if (test_bit(FF_EFFECT_PLAYING, &state->flags)	&&
-		test_bit(FF_EFFECT_QUEUE_UPDATE, &state->flags)) {
-
-		__clear_bit(FF_EFFECT_QUEUE_UPLOAD, &state->flags);
-
-		return t500rs_modify_ramp(t500rs, state, send_buffer);
-	}
-
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	top = ramp.end_level > ramp.start_level ? ramp.end_level : ramp.start_level;
-	bottom = ramp.end_level > ramp.start_level ? ramp.start_level : ramp.end_level;
-
-
-	difference = ((top - bottom) * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-	level = (top * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-	offset = effect.replay.delay;
-
-
-	send_buffer[1] = effect.id + 1;
-	send_buffer[2] = 0x6b;
-
-	send_buffer[3] = difference & 0xff;
-	send_buffer[4] = difference >> 8;
-
-	send_buffer[5] = level & 0xff;
-	send_buffer[6] = level >> 8;
-
-	send_buffer[9] = duration & 0xff;
-	send_buffer[10] = duration >> 8;
-
-	send_buffer[12] = 0x80;
-
-	t500rs_fill_envelope(send_buffer, 13, level,
-			effect.replay.length, &ramp.envelope);
-
-	send_buffer[22] = ramp.end_level > ramp.start_level ? 0x04 : 0x05;
-	send_buffer[23] = 0x4f;
-
-	send_buffer[24] = duration & 0xff;
-	send_buffer[25] = duration >> 8;
-
-	send_buffer[28] = offset & 0xff;
-	send_buffer[29] = offset >> 8;
-
-	send_buffer[31] = 0xff;
-	send_buffer[32] = 0xff;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed uploading ramp");
-
-	return ret;
-}
-
-static int t500rs_upload_spring(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	u8 *send_buffer = t500rs->send_buffer;
-	struct ff_effect effect = state->effect;
-	/* we only care about the first axis */
-	struct ff_condition_effect spring = state->effect.u.condition[0];
-	int ret, trans;
-	u16 duration, right_coeff, left_coeff, deadband_right, deadband_left, offset;
-
-	if (test_bit(FF_EFFECT_PLAYING, &state->flags)	&&
-		test_bit(FF_EFFECT_QUEUE_UPDATE, &state->flags)) {
-
-		__clear_bit(FF_EFFECT_QUEUE_UPLOAD, &state->flags);
-
-		return t500rs_modify_damper(t500rs, state, send_buffer);
-	}
-
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	send_buffer[1] = effect.id + 1;
-	send_buffer[2] = 0x64;
-
-	right_coeff = spring.right_coeff * spring_level / 100;
-	left_coeff = spring.left_coeff * spring_level / 100;
-
-	deadband_right = 0xfffe - spring.deadband - spring.center;
-	deadband_left = 0xfffe - spring.deadband + spring.center;
-
-	offset = effect.replay.delay;
-
-	send_buffer[3] = right_coeff & 0xff;
-	send_buffer[4] = right_coeff >> 8;
-
-	send_buffer[5] = left_coeff & 0xff;
-	send_buffer[6] = left_coeff >> 8;
-
-	send_buffer[7] = deadband_right & 0xff;
-	send_buffer[8] = deadband_right >> 8;
-
-	send_buffer[9] = deadband_left & 0xff;
-	send_buffer[10] = deadband_left >> 8;
-
-	memcpy(&send_buffer[11], spring_values, ARRAY_SIZE(spring_values));
-	send_buffer[28] = 0x4f;
-
-	send_buffer[29] = duration & 0xff;
-	send_buffer[30] = duration >> 8;
-
-	send_buffer[33] = offset & 0xff;
-	send_buffer[34] = offset >> 8;
-
-	send_buffer[36] = 0xff;
-	send_buffer[37] = 0xff;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed uploading spring\n");
-
-	return ret;
-}
-
-static int t500rs_upload_damper(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	u8 *send_buffer = t500rs->send_buffer;
-	struct ff_effect effect = state->effect;
-	/* we only care about the first axis */
-	struct ff_condition_effect spring = state->effect.u.condition[0];
-	int ret, trans, input_level;
-	u16 duration, right_coeff, left_coeff, deadband_right, deadband_left, offset;
-
-	if (test_bit(FF_EFFECT_PLAYING, &state->flags)	&&
-		test_bit(FF_EFFECT_QUEUE_UPDATE, &state->flags)) {
-
-		__clear_bit(FF_EFFECT_QUEUE_UPLOAD, &state->flags);
-
-		return t500rs_modify_damper(t500rs, state, send_buffer);
-	}
-
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	input_level = damper_level;
-	if (state->effect.type == FF_FRICTION)
-		input_level = friction_level;
-
-
-	send_buffer[1] = effect.id + 1;
-	send_buffer[2] = 0x64;
-
-	right_coeff = spring.right_coeff * input_level / 100;
-	left_coeff = spring.left_coeff * input_level / 100;
-
-	deadband_right = 0xfffe - spring.deadband - spring.center;
-	deadband_left = 0xfffe - spring.deadband + spring.center;
-
-	offset = effect.replay.delay;
-
-	send_buffer[3] = right_coeff & 0xff;
-	send_buffer[4] = right_coeff >> 8;
-
-	send_buffer[5] = left_coeff & 0xff;
-	send_buffer[6] = left_coeff >> 8;
-
-	send_buffer[7] = deadband_right & 0xff;
-	send_buffer[8] = deadband_right >> 8;
-
-	send_buffer[9] = deadband_left & 0xff;
-	send_buffer[10] = deadband_left >> 8;
-
-	memcpy(&send_buffer[11], damper_values, ARRAY_SIZE(damper_values));
-	send_buffer[28] = 0x4f;
-
-	send_buffer[29] = duration & 0xff;
-	send_buffer[30] = duration >> 8;
-
-	send_buffer[33] = offset & 0xff;
-	send_buffer[34] = offset >> 8;
-
-	send_buffer[36] = 0xff;
-	send_buffer[37] = 0xff;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed uploading spring\n");
-
-	return ret;
-}
-
-static int t500rs_upload_periodic(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	u8 *send_buffer = t500rs->send_buffer;
-	struct ff_effect effect = state->effect;
-	struct ff_periodic_effect periodic = state->effect.u.periodic;
-	int ret, trans;
-	u16 duration, magnitude, phase, period, offset;
-	s16 periodic_offset;
-
-	if (test_bit(FF_EFFECT_PLAYING, &state->flags)	&&
-		test_bit(FF_EFFECT_QUEUE_UPDATE, &state->flags)) {
-
-		__clear_bit(FF_EFFECT_QUEUE_UPLOAD, &state->flags);
-
-		return t500rs_modify_periodic(t500rs, state, send_buffer);
-	}
-
-	if (effect.replay.length == 0)
-		duration = 0xffff;
-	else
-		duration = effect.replay.length;
-
-	magnitude = (periodic.magnitude * fixp_sin16(effect.direction * 360 / 0x10000)) / 0x7fff;
-
-	phase = periodic.phase;
-	periodic_offset = periodic.offset;
-	period = periodic.period;
-	offset = effect.replay.delay;
-
-
-	send_buffer[1] = effect.id + 1;
-	send_buffer[2] = 0x6b;
-
-	send_buffer[3] = magnitude & 0xff;
-	send_buffer[4] = magnitude >> 8;
-
-	send_buffer[7] = phase & 0xff;
-	send_buffer[8] = phase >> 8;
-
-	send_buffer[5] = periodic_offset & 0xff;
-	send_buffer[6] = periodic_offset >> 8;
-
-	send_buffer[9] = period & 0xff;
-	send_buffer[10] = period >> 8;
-
-	send_buffer[12] = 0x80;
-
-	t500rs_fill_envelope(send_buffer, 13, magnitude,
-			effect.replay.length, &periodic.envelope);
-
-	send_buffer[21] = periodic.waveform - 0x57;
-	send_buffer[22] = 0x4f;
-
-	send_buffer[23] = duration & 0xff;
-	send_buffer[24] = duration >> 8;
-
-	send_buffer[27] = offset & 0xff;
-	send_buffer[28] = offset >> 8;
-
-	send_buffer[30] = 0xff;
-	send_buffer[31] = 0xff;
-
-	ret = t500rs_send_int(t500rs->input_dev, send_buffer, &trans);
-	if (ret)
-		hid_err(t500rs->hdev, "failed uploading periodic effect");
-
-	return ret;
-}
-
-static int t500rs_upload_effect(struct t500rs_device_entry *t500rs,
-		struct t500rs_effect_state *state)
-{
-	switch (state->effect.type) {
-	case FF_CONSTANT:
-		return t500rs_upload_constant(t500rs, state);
-	case FF_RAMP:
-		return t500rs_upload_ramp(t500rs, state);
-	case FF_SPRING:
-		return t500rs_upload_spring(t500rs, state);
-	case FF_DAMPER:
-	case FF_FRICTION:
-	case FF_INERTIA:
-		return t500rs_upload_damper(t500rs, state);
-	case FF_PERIODIC:
-		return t500rs_upload_periodic(t500rs, state);
-	default:
-		hid_err(t500rs->hdev, "invalid effect type: %x", state->effect.type);
-		return -1;
-	}
-}
-
+/* Timer and scheduling */
 static int t500rs_timer_helper(struct t500rs_device_entry *t500rs)
 {
 	struct t500rs_effect_state *state;
@@ -1020,6 +791,7 @@ static enum hrtimer_restart t500rs_timer(struct hrtimer *t)
 	}
 }
 
+/* Device initialization and cleanup */
 static int t500rs_upload(struct input_dev *dev,
 		struct ff_effect *effect, struct ff_effect *old)
 {
@@ -1123,8 +895,6 @@ static ssize_t spring_level_show(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR_RW(spring_level);
-
 static ssize_t damper_level_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -1156,8 +926,6 @@ static ssize_t damper_level_show(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR_RW(damper_level);
-
 static ssize_t friction_level_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -1187,8 +955,6 @@ static ssize_t friction_level_show(struct device *dev,
 
 	return count;
 }
-
-static DEVICE_ATTR_RW(friction_level);
 
 static ssize_t range_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
@@ -1257,187 +1023,13 @@ static ssize_t range_show(struct device *dev,
 	return count;
 }
 
+/* Device attributes for sysfs */
+static DEVICE_ATTR_RW(spring_level);
+static DEVICE_ATTR_RW(damper_level);
+static DEVICE_ATTR_RW(friction_level);
 static DEVICE_ATTR_RW(range);
 
-static void t500rs_set_autocenter(struct input_dev *dev, u16 value)
-{
-	struct hid_device *hdev = input_get_drvdata(dev);
-	struct t500rs_device_entry *t500rs;
-	u8 *send_buffer;
-	int ret, trans;
-
-    hid_info(hdev, "Begin autocenter \n");
-
-	t500rs = t500rs_get_device(hdev);
-	if (!t500rs) {
-		hid_err(hdev, "could not get device\n");
-		return;
-	}
-
-	send_buffer = t500rs->send_buffer;
-
-	send_buffer[0] = 0x08;
-	send_buffer[1] = 0x04;
-	send_buffer[2] = 0x01;
-
-	ret = t500rs_send_int(dev, send_buffer, &trans);
-	if (ret) {
-		hid_err(hdev, "failed setting autocenter");
-		return;
-	}
-
-	send_buffer[0] = 0x08;
-	send_buffer[1] = 0x03;
-
-	send_buffer[2] = value & 0xff;
-	send_buffer[3] = value >> 8;
-
-	ret = t500rs_send_int(dev, send_buffer, &trans);
-	if (ret)
-		hid_err(hdev, "failed setting autocenter");
-
-    hid_info(hdev, "set autocenter \n");
-}
-
-static void t500rs_set_gain(struct input_dev *dev, u16 gain)
-{
-	struct hid_device *hdev = input_get_drvdata(dev);
-	struct t500rs_device_entry *t500rs;
-	u8 *send_buffer;
-	int ret, trans;
-
-    hid_info(hdev, "Starting set gain phase\n");
-
-	t500rs = t500rs_get_device(hdev);
-	if (!t500rs) {
-		hid_err(hdev, "could not get device\n");
-		return;
-	}
-
-	send_buffer = t500rs->send_buffer;
-	send_buffer[0] = 0x02;
-	send_buffer[1] = SCALE_VALUE_U16(gain, 8);
-
-	ret = t500rs_send_int(dev, send_buffer, &trans);
-	if (ret)
-		hid_err(hdev, "failed setting gain: %i\n", ret);
-
-    hid_info(hdev, "Ending set gain phase\n");
-}
-
-static void t500rs_destroy(struct ff_device *ff)
-{
-	// maybe not necessary?
-}
-
-static int t500rs_open(struct input_dev *dev)
-{
-	struct t500rs_device_entry *t500rs;
-	struct hid_device *hdev = input_get_drvdata(dev);
-	u8 *send_buffer;
-	int ret, trans;
-
-    hid_info(hdev, "Starting open phase\n");
-
-	t500rs = t500rs_get_device(hdev);
-	if (!t500rs) {
-		hid_err(hdev, "could not get device\n");
-		return -1;
-	}
-
-	send_buffer = t500rs->send_buffer;
-
-	send_buffer[0] = 0x01;
-	send_buffer[1] = 0x05;
-
-	ret = t500rs_send_int(dev, send_buffer, &trans);
-	if (ret) {
-		hid_err(hdev, "failed sending interrupts\n");
-		goto err;
-	}
-    hid_info(hdev, "Ending open phase\n");
-
-err:
-	return t500rs->open(dev);
-}
-
-static void t500rs_close(struct input_dev *dev)
-{
-	int ret, trans;
-	struct hid_device *hdev = input_get_drvdata(dev);
-	struct t500rs_device_entry *t500rs;
-	u8 *send_buffer;
-
-    hid_info(hdev, "Starting close phase\n");
-
-	t500rs = t500rs_get_device(hdev);
-	if (!t500rs) {
-		hid_err(hdev, "could not get device\n");
-		return;
-	}
-
-	send_buffer = t500rs->send_buffer;
-
-	send_buffer[0] = 0x01;
-
-	ret = t500rs_send_int(dev, send_buffer, &trans);
-	if (ret) {
-		hid_err(hdev, "failed sending interrupts\n");
-		goto err;
-	}
-    hid_info(hdev, "Ending close phase... ok\n");
-err:
-	t500rs->close(dev);
-}
-
-static int t500rs_create_files(struct hid_device *hdev)
-{
-	int ret, ret2, ret3, ret4;
-
-    hid_info(hdev, "Before creation of files\n");
-
-	ret = device_create_file(&hdev->dev, &dev_attr_range);
-    hid_info(hdev, "Creation of range file [%i]\n", ret);
-	if (ret) {
-		hid_warn(hdev, "unable to create sysfs interface for range\n");
-		goto attr_range_err;
-	}
-
-	ret2 = device_create_file(&hdev->dev, &dev_attr_spring_level);
-    hid_info(hdev, "Creation of spring file [%i]\n", ret2);
-	if (ret2) {
-		hid_warn(hdev, "unable to create sysfs interface for spring_level\n");
-		goto attr_spring_err;
-	}
-
-	ret3 = device_create_file(&hdev->dev, &dev_attr_damper_level);
-    hid_info(hdev, "Creation of damper file [%i]\n", ret3);
-	if (ret3) {
-		hid_warn(hdev, "unable to create sysfs interface for damper_level\n");
-		goto attr_damper_err;
-	}
-
-	ret4 = device_create_file(&hdev->dev, &dev_attr_friction_level);
-    hid_info(hdev, "Creation of friction file [%i]\n", ret4);
-	if (ret4) {
-		hid_warn(hdev, "unable to create sysfs interface for friction_level\n");
-		goto attr_friction_err;
-	}
-
-	return ret && ret2 && ret3 && ret4;
-
-	// if the creation of dev_attr_friction fails, we don't need to remove it
-	// device_remove_file(&hdev->dev, &dev_attr_friction_level);
-attr_friction_err:
-	device_remove_file(&hdev->dev, &dev_attr_damper_level);
-attr_damper_err:
-	device_remove_file(&hdev->dev, &dev_attr_spring_level);
-attr_spring_err:
-	device_remove_file(&hdev->dev, &dev_attr_range);
-attr_range_err:
-	return ret;
-}
-
+/* Device initialization and cleanup */
 static int t500rs_init(struct hid_device *hdev, const signed short *ff_bits)
 {
 	struct t500rs_device_entry *t500rs;
@@ -1654,9 +1246,8 @@ static void t500rs_remove(struct hid_device *hdev)
 
 static __u8 *t500rs_report_fixup(struct hid_device *hdev, __u8 *rdesc, unsigned int *rsize)
 {
-	rdesc = t500rs_rdesc_fixed;
-	*rsize = sizeof(t500rs_rdesc_fixed);
-	return rdesc;
+    /* Replace the original descriptor with our fixed version */
+    return (u8 *)t500_report_descriptor;
 }
 
 static const struct hid_device_id t500rs_devices[] = {
@@ -1676,3 +1267,6 @@ static struct hid_driver t500rs_driver = {
 module_hid_driver(t500rs_driver);
 
 MODULE_LICENSE("GPL");
+
+MODULE_AUTHOR("Thrustmaster");
+MODULE_DESCRIPTION("Force feedback driver for Thrustmaster T500RS Racing Wheel");
